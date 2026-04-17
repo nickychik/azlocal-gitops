@@ -1,0 +1,302 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo3tier
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+  namespace: demo3tier
+type: Opaque
+stringData:
+  mysql-root-password: RootPass123!
+  mysql-password: AppPass123!
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init
+  namespace: demo3tier
+data:
+  init.sql: |
+    USE appdb;
+    CREATE TABLE IF NOT EXISTS products (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL
+    );
+    INSERT INTO products (name) VALUES
+      ('Azure Local Demo Item 1'),
+      ('Azure Local Demo Item 2'),
+      ('Azure Local Demo Item 3');
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: demo3tier
+spec:
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: demo3tier
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: mysql-root-password
+            - name: MYSQL_DATABASE
+              value: appdb
+            - name: MYSQL_USER
+              value: appuser
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: mysql-password
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+            - name: mysql-init-volume
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 -uroot -p$MYSQL_ROOT_PASSWORD"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      volumes:
+        - name: mysql-init-volume
+          configMap:
+            name: mysql-init
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-code
+  namespace: demo3tier
+data:
+  app.py: |
+    from flask import Flask, jsonify
+    import mysql.connector
+    import os
+    import time
+
+    app = Flask(__name__)
+
+    def get_conn():
+        return mysql.connector.connect(
+            host="mysql",
+            user="appuser",
+            password=os.environ["DB_PASSWORD"],
+            database="appdb"
+        )
+
+    @app.route("/health")
+    def health():
+        return "ok", 200
+
+    @app.route("/api/products")
+    def products():
+        last_error = None
+        for _ in range(10):
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute("SELECT id, name FROM products ORDER BY id")
+                rows = cur.fetchall()
+                cur.close()
+                conn.close()
+                return jsonify({
+                    "count": len(rows),
+                    "items": [{"id": r[0], "name": r[1]} for r in rows]
+                })
+            except Exception as e:
+                last_error = str(e)
+                time.sleep(3)
+        return jsonify({"error": last_error}), 500
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=5000)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: demo3tier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: python:3.11-slim
+          command: ["sh", "-c"]
+          args:
+            - pip install flask mysql-connector-python && python /app/app.py
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: mysql-password
+          ports:
+            - containerPort: 5000
+          volumeMounts:
+            - name: backend-code-volume
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: backend-code-volume
+          configMap:
+            name: backend-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: demo3tier
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-code
+  namespace: demo3tier
+data:
+  app.py: |
+    from flask import Flask
+    import requests
+    import datetime
+
+    app = Flask(__name__)
+
+    @app.route("/")
+    def home():
+        try:
+            r = requests.get("http://backend:5000/api/products", timeout=5)
+            data = r.json()
+            items_html = "".join([f"<li>{item['id']}: {item['name']}</li>" for item in data.get("items", [])])
+            count = data.get("count", 0)
+            body = f"""
+            <html>
+            <head><title>Azure Local 3-Tier Demo</title></head>
+            <body style="font-family: Arial; margin: 40px;">
+              <h1>Azure Local 3-Tier Demo</h1>
+              <p><b>Frontend:</b> Flask web app</p>
+              <p><b>Backend:</b> Flask API service</p>
+              <p><b>Database:</b> MySQL with persistent storage</p>
+              <p><b>Time:</b> {datetime.datetime.now()}</p>
+              <h2>Products ({count})</h2>
+              <ul>{items_html}</ul>
+            </body>
+            </html>
+            """
+            return body
+        except Exception as e:
+            return f"<h1>Frontend error</h1><pre>{e}</pre>", 500
+
+    @app.route("/health")
+    def health():
+        return "ok", 200
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=8080)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo3tier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: python:3.11-slim
+          command: ["sh", "-c"]
+          args:
+            - pip install flask requests && python /app/app.py
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: frontend-code-volume
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: frontend-code-volume
+          configMap:
+            name: frontend-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: demo3tier
+spec:
+  selector:
+    app: frontend
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 8080
