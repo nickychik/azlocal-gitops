@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azure-local-demo
+  labels:
+    app: demo-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+    spec:
+      containers:
+      - name: demo-container
+        image: mcr.microsoft.com/azuredocs/azure-vote-front:v1 # A simple non-nginx sample image
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "250m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-service
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+  selector:
+    app: demo-app
